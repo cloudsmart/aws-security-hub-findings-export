@@ -142,7 +142,7 @@ Resources:
     Properties:
       Code:
         ZipFile: !Sub |
-          import boto3, json, logging
+          import boto3, json, logging, re
           s3_resource = boto3.resource('s3')
           s3_client = boto3.client('s3')
           logger = logging.getLogger()
@@ -162,6 +162,21 @@ Resources:
                   response = s3_client.get_object(Bucket=bucket, Key=object_key)
                   findings = '['+ response['Body'].read().decode('utf-8').replace('}{','},\n{') +']'
                   
+                  #following line replaces :0/ with _ to fix an issue with Glue data catalog down the road
+                  findings = re.sub(":0/", "_", findings)
+                  
+                  #following line replaces aws/securityhub/FindingId with aws_securityhub_FindingId to fix an issue with Glue data catalog down the road
+                  findings = re.sub("aws/securityhub/FindingId", "aws_securityhub_FindingId", findings)
+
+                  #following line replaces aws/securityhub/CompanyName with aws_securityhub_CompanyName to fix an issue with Glue data catalog down the road
+                  findings = re.sub("aws/securityhub/CompanyName", "aws_securityhub_CompanyName", findings)
+
+                  #following line replaces aws/securityhub/ProductName with aws_securityhub_ProductName to fix an issue with Glue data catalog down the road
+                  findings = re.sub("aws/securityhub/ProductName", "aws_securityhub_ProductName", findings)
+
+                  #following line replaces aws/securityhub/annotation with aws_securityhub_annotation to fix an issue with Glue data catalog down the road
+                  findings = re.sub("aws/securityhub/annotation", "aws_securityhub_annotation", findings)
+
                   findings_list = json.loads(findings)
                   record_count += len(findings_list)
                   output = {}
@@ -183,7 +198,7 @@ Resources:
                           product_name = item['resources'][0].split('/')[2]
                           region = item['resources'][0].split('/')[3]
                           account_id = item['resources'][0].split('/')[4]
-                      key = account_id + '/' + product_name + '/'+region
+                      key = account_id + '/' + product_name + '/'+ region
                       logger.info( f'key is {key}')
 
                       if key not in output:
@@ -198,8 +213,30 @@ Resources:
                           body += json.dumps(version) + '\n'
                       s3_resource.Bucket(bucket).put_object(Key=s3_path, Body=body)
 
-              return 'Processed: ' + str(record_count) + ' logs'
-      Handler: index.handler
+                  #Assume cross account  role
+                  sts_client = boto3.client('sts') 
+                  sts_response =  sts_client.assume_role(RoleArn='arn:aws:iam::675958891276:role/KinesisDataStreamRW-nress-dev-0', 
+                      RoleSessionName= 'SecurityHubFindings', 
+                      DurationSeconds=900) 
+
+                  #Configure the Kinesis client using the cross-account role
+                  kinesis_client = boto3.client('kinesis', region_name='ca-central-1',
+                      aws_access_key_id = sts_response['Credentials']['AccessKeyId'], 
+                      aws_secret_access_key = sts_response['Credentials']['SecretAccessKey'], 
+                      aws_session_token = sts_response['Credentials']['SessionToken'])
+                  
+                  for key in output:
+                      partition_key = 'AWSLogs/'+ key +'/'+ partition  + '/'  + object_name + '.json'
+                      body = ''
+                      for version in output[key]:
+                          body += json.dumps(version) + '\n'
+
+                      #Write to the Kinesis stream in other account 
+                      response = kinesis_client.put_record(
+                                  StreamName='nress-dev-0',
+                                  Data= body,
+                                  PartitionKey= partition_key)
+                  Handler: index.handler
       Runtime: python3.7
       Description: Function sorts findings by AWS account id/product/region
       MemorySize: 128
